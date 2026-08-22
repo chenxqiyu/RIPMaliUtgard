@@ -95,3 +95,21 @@ adb shell /data/local/tmp/kort_miboxs
 - 同仓库其它 kort 模板：`kort_huawei_t3_7.c`（Mali-450，含 SELinux 绕过）、
   `kort_t11_translator.c`、`kort_soyes_xs11.c`。
 - 思路博客见 `README.md` 顶部链接。
+
+
+
+手动
+
+rem 编译（NDK 21.4，32 位 armeabi-v7a，静态链接）
+set NDK=C:\Users\Administrator\AppData\Local\Android\Sdk\ndk\21.4.7075529
+set CLANG=%NDK%\toolchains\llvm\prebuilt\windows-x86_64\bin\armv7a-linux-androideabi24-clang
+%CLANG% kort_miboxs.c -o kort_miboxs -static
+%CLANG% kort_probe_miboxs.c -o kort_probe_miboxs -static
+
+rem 上传
+adb push kort_miboxs /data/local/tmp/
+adb push kort_probe_miboxs /data/local/tmp/
+
+rem 运行
+adb shell chmod 755 /data/local/tmp/kort_probe_miboxs /data/local/tmp/kort_miboxs
+adb shell /data/local/tmp/kort_probe_miboxs
