@@ -386,10 +386,27 @@ static int wb_write_u32(uint32_t *buf, uint32_t gpu_target, uint32_t value,
     job.frame_registers[FR_HEIGHT]          = PP_HEIGHT;  /* 0x10 */
     job.frame_registers[FR_FRAG_STACK_ADDR] = GPU_VA_DATA + OFF_STACK;
     job.frame_registers[FR_FRAG_STACK_SIZE] = (wb_cfg & 0x8) ? 0x400 : 0;
-    job.frame_registers[FR_DUBYA]           = 0x77;
-    job.frame_registers[FR_BLOCKING]        = 0;
-    job.frame_registers[FR_SCALE]           = 0x0C;
-    job.frame_registers[FR_FOUREIGHT]       = 0x8888;
+    if (wb_cfg & 0x10) {
+        /* cfg "clean": zero out Mali-400-specific frame regs (0x8888/0x0C/0x77
+         * not present in the Mali-450 libGLES_mali.so) */
+        job.frame_registers[FR_DUBYA]     = 0;
+        job.frame_registers[FR_BLOCKING]  = 0;
+        job.frame_registers[FR_SCALE]     = 0;
+        job.frame_registers[FR_FOUREIGHT] = 0;
+    } else {
+        job.frame_registers[FR_DUBYA]     = 0x77;  /* Mali-400 legacy */
+        job.frame_registers[FR_BLOCKING]  = 0;
+        job.frame_registers[FR_SCALE]     = 0x0C;  /* Mali-400 legacy */
+        job.frame_registers[FR_FOUREIGHT] = 0x8888;/* Mali-400 legacy tilebuffer */
+    }
+
+    if (wb_cfg & 0x10) {
+        /* also simplify the RSW: keep only the shader address */
+        uint32_t *rsw_clean = (uint32_t *)((uint8_t *)buf + OFF_RSW);
+        rsw_clean[0x08] = 0;
+        rsw_clean[0x09] = (GPU_VA_DATA + OFF_SHADER) | 5;
+        rsw_clean[0x0D] = 0;
+    }
 
     if (wb_cfg & 0x1) {
         /* WB enabled: Source Select = 2 (color source) */
@@ -597,24 +614,25 @@ int main(int argc, char **argv)
      */
     if (mode_diag) {
         uint32_t verify_gpu = GPU_VA_DATA + 0x3000;
-        const char *names[4] = {
+        const char *names[6] = {
             "cfg0: WB disabled (render-only)          ",
             "cfg1: WB on, flags=0, stack=0            ",
             "cfg2: WB on, legacy MRT_BITS=4 (kort)    ",
             "cfg3: WB on, MRT_BITS=4 + MRT_Enable=4   ",
+            "cfg4: WB on, MRT=4, stack=0x400          ",
+            "cfg5: CLEAN (no WB, zero Mali400 frame)  ",
         };
-        uint32_t cfgs[4] = { 0x0, 0x1, 0x3, 0x7 };
+        uint32_t cfgs[6] = { 0x0, 0x1, 0x3, 0x7, 0xB, 0x10 };
 
         printf("[DIAG] PP job config discrimination (target = GPU-own mem 0x%08x)\n", verify_gpu);
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 6; i++) {
             printf("  %s\n", names[i]);
-            r = wb_write_u32((uint32_t *)buf, verify_gpu, 0x41414141u, cfgs[i]);
+            r = wb_write_u32((uint32_t *)buf, verify_gpu, 0x41414141u + (uint32_t)i, cfgs[i]);
             printf("  -> ret=%d\n\n", r);
         }
 
-        printf("[DIAG] variant with FR_FRAG_STACK_SIZE=0x400:\n");
-        printf("  cfg4: WB on, flags=0, stack=0x400       \n");
-        r = wb_write_u32((uint32_t *)buf, verify_gpu, 0x42424242u, 0x9);
+        printf("[DIAG] cfg6: CLEAN + stack=0x400 (zero Mali400 frame + no WB):\n");
+        r = wb_write_u32((uint32_t *)buf, verify_gpu, 0x46464646u, 0x18);
         printf("  -> ret=%d\n", r);
         goto out;
     }
