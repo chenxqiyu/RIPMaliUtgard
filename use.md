@@ -96,20 +96,62 @@ img文件在F:\down\player6\update_miboxs_a12
 - 设备树 bootargs 不可读
 - **需要寻找 KASLR 泄露方法**
 
+## 重大进展 (2026-08-25)
+
+### A. ioctl 编号修正 (从 mali.ko 逆向确认)
+从固件提取 `mali.ko` (561816 字节, 未剥离符号, Amlogic 开源 Utgard 驱动 r9p0 系) 逆向确认:
+
+| ioctl | 命令值 | 说明 |
+|-------|--------|------|
+| MEM_ALLOC | 0xC0288300 (type=0x83, nr=0, size=40) | **之前探测代码错用 nr=5 → 全 ENOTTY!** |
+| MEM_FREE | 0xC0108301 (type=0x83, nr=1, size=16) | |
+| MEM_BIND | 0xC0288302 (type=0x83, nr=2, size=40) | 已验证: 绑定任意物理页到 GPU VA ✓ |
+| MEM_UNBIND | 0xC0108303 (type=0x83, nr=3, size=16) | |
+| PP_START_JOB | 0xC1988400 (type=0x84, nr=0, size=408) | 408 字节与探测一致 ✓ |
+| WAIT_FOR_NOTIFICATION | 0xC0088202 (type=0x82, nr=2, size=8) | |
+| CORE nr=13 | 0xC008820D (DUMP_STATE, 8字节) | **不是 CREATE_CONTEXT!** |
+
+- subsystem: CORE=0x82, MEMORY=0x83, PP=0x84, GP=0x85
+- **不需要 CREATE_CONTEXT / 不需要 context!** kort 路线直接 BIND + PP job。
+- 驱动没有 compat 转换层,直接 `__arch_copy_from_user(job, user_args, 408)` 拷贝 32 位用户结构。
+
+### B. 结构体布局确认 (mali_pp_job_create 反汇编)
+- ALLOC_MEM 40 字节: ctx(u64@0) + **gpu_vaddr(u32@8, 输入!)** + vsize@12 + psize@16 + flags@20 + backend_handle(u64@24, 输出) + secure_shared_fd@32
+- **gpu_vaddr 是输入字段** → ALLOC 时必须指定 GPU 地址 (如 0x40000000)
+- PP_START_JOB 408 字节: kort_miboxs.c 布局正确, 驱动读取 num_cores@328 / flags@352 匹配
+- BIND_MEM 40 字节: ctx(u64) + vaddr@8 + size@12 + flags@16 + union{phys_addr@20, rights@24, flags@28} + pad@32 + fd@36
+
+### C. physmem 读取测试结论 (kort_phys_read, 实测)
+- ALLOC_MEM (nr=0) 返回 0 不再 ENOTTY ✓ (ioctl 编号修正生效)
+- BIND_MEM 绑定内核物理页 0x01080000 → GPU VA 0x40200000 成功 ✓
+- **mmap 绑定页失败 (EFAULT)** → 不能 CPU 直接读 → **必须 PP job (GPU DMA) 写入**
+
+### D. 物理地址提权方案 (无需 KASLR!)
+从 boot.img 确认 **KernelAddr = 0x01080000** (text_offset, 无物理 KASLR)。
+用 vmlinux-to-elf 从 split_img/kernel 提取符号, 基址 0xffffff8009080000 (已验证: Image 文件 0x175f960 处 = "/sbin/modprobe" 字符串, 与 modprobe_path 符号偏移吻合):
+
+| 目标 | 虚拟地址 | 物理地址 | 页内偏移 |
+|------|---------|---------|---------|
+| modprobe_path | 0xffffff800a7df960 | **0x027df960** | 0xf960 |
+| selinux_enforcing | 0xffffff800aa394ec | **0x02a394ec** | 0x4ec (.bss) |
+| init_cred | 0xffffff800a7e0f70 | 0x027e0f70 | |
+| prepare_kernel_cred | 0xffffff80090d7f28 | | |
+| commit_creds | 0xffffff80090d7988 | | |
+
+物理地址公式: PA = 0x01080000 + (VA - 0xffffff8009080000)
+
+### 下一步
+1. 构造 PP job 验证写入 (先写 GPU 自己内存, 读回验证)
+2. 成功后 BIND modprobe_path 物理页 0x027df000 → PP job 多次写字符串
+3. 触发 modprobe → root (uid=0)
+
 ## 待解决的关键问题
 
-### 高优先级
-1. **找到 CREATE_CONTEXT ioctl** - 没有 GPU context 就无法提交 PP job
-   - 可能需要在 CORE subsystem 更仔细地探测
-   - 可能需要特定的输入参数才能成功创建
-
-2. **搞清楚 ALLOC_MEM 的字段布局** - 需要分配 GPU 内存来构造 PP job
-   - 40 字节结构体，需要确定哪些是输入字段
-
-3. **验证 PP job 写入原语** - 核心漏洞利用能力
-   - 需要能让 GPU 向指定物理地址写入数据
-
-4. **KASLR 泄露** - 需要知道内核基址才能计算目标地址
+### 高优先级 (旧, 部分已解决)
+1. ~~找到 CREATE_CONTEXT ioctl~~ - **已确认不需要 context** (kort 路线直接 BIND + PP)
+2. ~~搞清楚 ALLOC_MEM 的字段布局~~ - **已确认: gpu_vaddr 是输入字段**
+3. **验证 PP job 写入原语** - 核心漏洞利用能力 (进行中)
+4. ~~KASLR 泄露~~ - **已绕过: 用物理地址方案 (PA = 0x01080000 + VA偏移)**
 
 ### 中优先级
 5. **PAN 保护绕过** - ARM64 内核有 PAN，需要用 ROP/JOP
