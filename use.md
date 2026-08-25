@@ -30,8 +30,10 @@ img文件在F:\down\player6\update_miboxs_a12
 - `kort_pp_fine.c` - PP subsystem ioctl 细粒度探测
 - `kort_core_probe.c` - CORE subsystem ioctl 探测
 - `kort_core_analyze.c` - CORE ioctl 返回数据分析
-- `kort_alloc_probe.c` - ALLOC_MEM 字段布局探测
+- `kort_alloc_probe.c` - ALLOC_MEM 字段布局探测（旧, ioctl 编号已废弃）
 - `kort_ion_test.c` - ION 内存分配测试
+- `kort_phys_read.c` - physmem 读取验证（2026-08-25 新增）
+- `kort_pp_verify.c` - PP job 写入原语验证（2026-08-25 新增）
 - `build.ps1` - 编译脚本（早期）
 
 ### 参考 exploit 目录
@@ -98,8 +100,13 @@ img文件在F:\down\player6\update_miboxs_a12
 
 ## 重大进展 (2026-08-25)
 
-### A. ioctl 编号修正 (从 mali.ko 逆向确认)
-从固件提取 `mali.ko` (561816 字节, 未剥离符号, Amlogic 开源 Utgard 驱动 r9p0 系) 逆向确认:
+### A. mali.ko 驱动逆向 (r10p1!)
+从固件提取 `mali.ko` (561816 字节, **未剥离符号**) 确认:
+- **驱动版本: r10p1** (源码路径暴露: `/vendor/amlogic/common/gpu/utgard/r10p1/common/mali_pp_job.c`)
+- 支持 Mali-400 MP / Mali-450 MP
+- 与 LineageOS Amlogic (GXL/GXM/G12A) 用的同一驱动
+
+**完整 ioctl 表 (从 mali_ioctl 反汇编解码, 已验证):**
 
 | ioctl | 命令值 | 说明 |
 |-------|--------|------|
@@ -108,18 +115,21 @@ img文件在F:\down\player6\update_miboxs_a12
 | MEM_BIND | 0xC0288302 (type=0x83, nr=2, size=40) | 已验证: 绑定任意物理页到 GPU VA ✓ |
 | MEM_UNBIND | 0xC0108303 (type=0x83, nr=3, size=16) | |
 | PP_START_JOB | 0xC1988400 (type=0x84, nr=0, size=408) | 408 字节与探测一致 ✓ |
-| WAIT_FOR_NOTIFICATION | 0xC0088202 (type=0x82, nr=2, size=8) | |
-| CORE nr=13 | 0xC008820D (DUMP_STATE, 8字节) | **不是 CREATE_CONTEXT!** |
+| WAIT_FOR_NOTIFICATION | **0xC0688202** (type=0x82, nr=2, size=104) | 注意: size=104 不是 8! |
+| CREATE_CONTEXT | **0xC0108203** (CORE nr=3, size=16) | 返回 version=0x03840384 |
+| TERMINATE_CONTEXT | 0xC0108204 (CORE nr=4, size=16) | |
+| CORE nr=13 | 0xC008820D (DUMP_STATE, 8字节) | 不是 CREATE_CONTEXT |
 
 - subsystem: CORE=0x82, MEMORY=0x83, PP=0x84, GP=0x85
-- **不需要 CREATE_CONTEXT / 不需要 context!** kort 路线直接 BIND + PP job。
-- 驱动没有 compat 转换层,直接 `__arch_copy_from_user(job, user_args, 408)` 拷贝 32 位用户结构。
+- 驱动无 compat 转换层, `_mali_ukk_pp_start_job` 直接 `__arch_copy_from_user(job, user_args, 408)` 拷贝 32 位用户结构
+- `_mali_ukk_wait_for_notification`: 内核直接写 args[8]=type, memcpy 数据到 args+16
 
-### B. 结构体布局确认 (mali_pp_job_create 反汇编)
+### B. 结构体布局确认 (mali_pp_job_create / mem_allocate 反汇编)
 - ALLOC_MEM 40 字节: ctx(u64@0) + **gpu_vaddr(u32@8, 输入!)** + vsize@12 + psize@16 + flags@20 + backend_handle(u64@24, 输出) + secure_shared_fd@32
 - **gpu_vaddr 是输入字段** → ALLOC 时必须指定 GPU 地址 (如 0x40000000)
-- PP_START_JOB 408 字节: kort_miboxs.c 布局正确, 驱动读取 num_cores@328 / flags@352 匹配
+- PP_START_JOB 408 字节: kort_miboxs.c 布局正确 (驱动读取 num_cores@328 / flags@352 匹配; 结构含 u64 → 对齐后 408)
 - BIND_MEM 40 字节: ctx(u64) + vaddr@8 + size@12 + flags@16 + union{phys_addr@20, rights@24, flags@28} + pad@32 + fd@36
+- CREATE_CONTEXT 16 字节: version(u32@0) + pad + ctx(u64@8)
 
 ### C. physmem 读取测试结论 (kort_phys_read, 实测)
 - ALLOC_MEM (nr=0) 返回 0 不再 ENOTTY ✓ (ioctl 编号修正生效)
@@ -140,48 +150,59 @@ img文件在F:\down\player6\update_miboxs_a12
 
 物理地址公式: PA = 0x01080000 + (VA - 0xffffff8009080000)
 
+### E. PP job 测试现状 (kort_pp_verify, 实测 2026-08-25 15:20)
+- sizeof(pp_start_job_s)=408, sizeof(wait_notif)=104 ✓ (与驱动期望一致)
+- ALLOC_MEM (gpu_vaddr=0x40000000 输入) 成功 + mmap 成功 ✓
+- **PP_START_JOB 提交成功, WAIT 收到 notif.type=0x00020010 (PP_FINISHED)**
+- **但 status = 0x00800000 = UNKNOWN_ERR** (bit 23) — GPU 执行失败, 写入未落地
+- 换 clear_color=0x12345678 再测 → 同样 UNKNOWN_ERR
+
+**驱动挂起教训 (重要!):**
+- `msync()` 对 /dev/mali 的 mmap → **永久挂起** (不要用!)
+- CREATE_CONTEXT + flags=1 + `__builtin___clear_cache` 组合 → PP_START_JOB **永久挂起** (alarm 无效 = 不可中断睡眠, 需重启设备或等超时)
+- 每次挂起后进程被杀, 设备本身存活
+
+**UNKNOWN_ERR 可能原因 (待排查):**
+1. **GPU 读不到 job 数据** — CPU 写 cache 未 flush 到 GPU 可见 (r10p1 无 write-combining? 需检查驱动 cache 策略)
+2. **context 未真正创建** — CREATE_CONTEXT 返回 ctx=0x03840384 可疑 (与 version 同值, 可能只是回显)
+3. **PLB/RSW 格式** — kort 的配置来自 Mali-400 老驱动, r10p1 可能不同
+4. shader 魔数 0x00020425/0x01e007cf 已在 libGLES_mali.so 中确认存在 → shader 格式应该兼容
+
 ### 下一步
-1. 构造 PP job 验证写入 (先写 GPU 自己内存, 读回验证)
-2. 成功后 BIND modprobe_path 物理页 0x027df000 → PP job 多次写字符串
-3. 触发 modprobe → root (uid=0)
+1. 排查 UNKNOWN_ERR: 先去掉 CREATE_CONTEXT/flags 回到基线, 再逐个变量测试 (cache flush 用 cacheflush() syscall 而非 msync)
+2. 尝试创建 context 的正确姿势: 对照 libGLES_mali.so 反汇编确认 CREATE_CONTEXT 调用参数
+3. 成功后 BIND modprobe_path 物理页 0x027df000 → PP job 多次写字符串
+4. 触发 modprobe → root (uid=0)
 
 ## 待解决的关键问题
 
-### 高优先级 (旧, 部分已解决)
-1. ~~找到 CREATE_CONTEXT ioctl~~ - **已确认不需要 context** (kort 路线直接 BIND + PP)
-2. ~~搞清楚 ALLOC_MEM 的字段布局~~ - **已确认: gpu_vaddr 是输入字段**
-3. **验证 PP job 写入原语** - 核心漏洞利用能力 (进行中)
+### 高优先级 (2026-08-25 更新)
+1. **解决 PP job UNKNOWN_ERR** - 核心瓶颈 (GPU 执行失败)
+   - 排查方向: cache flush 方式 / context 创建 / PLB-RSW 格式
+2. ~~找到 CREATE_CONTEXT ioctl~~ - **已找到: 0xC0108203**, 但 ctx 输出可疑 (0x03840384 与 version 同值), 需对照 libGLES_mali.so 确认正确调用
+3. ~~搞清楚 ALLOC_MEM 的字段布局~~ - **已确认: gpu_vaddr 是输入字段**
 4. ~~KASLR 泄露~~ - **已绕过: 用物理地址方案 (PA = 0x01080000 + VA偏移)**
 
 ### 中优先级
 5. **PAN 保护绕过** - ARM64 内核有 PAN，需要用 ROP/JOP
 6. **SELinux 关闭** - 提权后需要关闭 SELinux
 
-## 下一步计划
+## 下一步计划 (2026-08-25 更新)
 
-### 阶段 1：完善 GPU 原语
-1. 继续探测 CORE ioctl，找到 CREATE_CONTEXT
-   - 尝试不同的输入值（不仅仅是全零）
-   - 查看内核源码中的 `mali_ukk_core.h` 确认 ioctl 编号
+### 阶段 1: 解决 PP job UNKNOWN_ERR (当前瓶颈)
+1. 回到基线配置 (无 CREATE_CONTEXT/flags/clear_cache), 确认仍 UNKNOWN_ERR
+2. 逐个变量测试: cacheflush() syscall / flags bit0 / num_cores
+3. 对照 libGLES_mali.so 反汇编确认: CREATE_CONTEXT 调用方式 + PP job 寄存器真实配置
+4. 参考 Lima (Mesa) 的 Mali-450 PP job 构造 (开源已验证)
 
-2. 逆向 ALLOC_MEM 字段布局
-   - 从内核源码获取结构体定义
-   - 或通过多字段组合测试推断
+### 阶段 2: 物理写入
+1. BIND modprobe_path 物理页 0x027df000 → GPU VA
+2. PP job 多次 WB 写 "/data/local/tmp/x" 字符串
+3. 触发 modprobe → root (uid=0)
 
-3. 用 Mali 自己分配的内存验证 PP 写入
-   - 分配两块内存：一块放 PP job 描述符，一块做目标
-   - 提交 PP job 后读取目标内存看是否被修改
-
-### 阶段 2：信息泄露
-1. 寻找 KASLR 泄露点
-   - /proc/slabinfo？
-   - 驱动 bug 导致的信息泄露？
-   - GPU 侧信道？
-
-### 阶段 3：提权链
-1. 找到可覆写的内核目标（如 `selinux_enforcing`、`task_struct->cred` 等）
-2. 构造 ROP 链（如果需要执行代码）
-3. 完成完整 exploit
+### 阶段 3: 备用提权链
+1. selinux_enforcing 物理 0x02a394ec 写 0 (一次 job) → 降级 SELinux
+2. 若 PP job 不可行, 考虑 frels UAF 路线 (64 位内核适配复杂, 备选)
 
 ## 编译命令模板
 

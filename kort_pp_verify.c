@@ -29,6 +29,8 @@
 #define MALI_IOC_MEM_FREE  0xC0108301
 #define MALI_IOC_PP_START_JOB 0xC1988400
 #define MALI_IOC_WAIT_FOR_NOTIFICATION 0xC0688202
+#define MALI_IOC_CREATE_CONTEXT 0xC0108203  /* CORE nr=3 size=16 */
+#define MALI_IOC_TERMINATE_CONTEXT 0xC0108204
 
 #define PAGE_SIZE 4096
 
@@ -224,8 +226,7 @@ static int submit_wb_job(int fd, uint32_t *buf /*mmap 的 job 数据区*/,
     *timeline_out = 0;
     job.timeline_point_ptr = (uint64_t)(uintptr_t)timeline_out;
 
-    /* flush CPU cache -> GPU 可见 */
-    msync(buf, 0x4000, MS_SYNC);
+    /* flush CPU cache -> GPU 可见 (注意: msync 会卡住 /dev/mali 映射, 只用 clear_cache) */
     __builtin___clear_cache((char*)buf, (char*)buf + 0x4000);
 
     /* 提交 */
@@ -268,6 +269,15 @@ int main() {
     int fd = open("/dev/mali", O_RDWR);
     if (fd < 0) { perror("[-] open /dev/mali"); return 1; }
     printf("[+] opened /dev/mali fd=%d\n", fd);
+
+    /* 创建 GPU context (r10p1 驱动可能要求) */
+    printf("\n[0] CREATE_CONTEXT ...\n");
+    {
+        uint64_t ctx_args[2] = { 0x03840384, 0 };  /* version 输入, ctx 输出 */
+        int r = tio(fd, MALI_IOC_CREATE_CONTEXT, ctx_args, 3);
+        printf("  ret=%d version_out=0x%08x ctx=0x%08llx\n",
+               r, (uint32_t)ctx_args[0], (unsigned long long)ctx_args[1]);
+    }
 
     /* ALLOC_MEM: gpu_vaddr 是输入 */
     const uint32_t GPU_VA_DATA = 0x40000000;
