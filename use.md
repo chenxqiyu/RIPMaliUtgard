@@ -1,3 +1,6 @@
+设备信息
+I:\云盘缓存\down\miboxs\RIPMaliUtgard\miboxs.txt
+
 # Mi Box S Root via Mali Utgard - 工作进展记录
 
 ## 目标
