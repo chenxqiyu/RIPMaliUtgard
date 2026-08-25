@@ -136,19 +136,7 @@ img文件在F:\down\player6\update_miboxs_a12
 - BIND_MEM 绑定内核物理页 0x01080000 → GPU VA 0x40200000 成功 ✓
 - **mmap 绑定页失败 (EFAULT)** → 不能 CPU 直接读 → **必须 PP job (GPU DMA) 写入**
 
-### D. 物理地址提权方案 (无需 KASLR!)
-从 boot.img 确认 **KernelAddr = 0x01080000** (text_offset, 无物理 KASLR)。
-用 vmlinux-to-elf 从 split_img/kernel 提取符号, 基址 0xffffff8009080000 (已验证: Image 文件 0x175f960 处 = "/sbin/modprobe" 字符串, 与 modprobe_path 符号偏移吻合):
 
-| 目标 | 虚拟地址 | 物理地址 | 页内偏移 |
-|------|---------|---------|---------|
-| modprobe_path | 0xffffff800a7df960 | **0x027df960** | 0xf960 |
-| selinux_enforcing | 0xffffff800aa394ec | **0x02a394ec** | 0x4ec (.bss) |
-| init_cred | 0xffffff800a7e0f70 | 0x027e0f70 | |
-| prepare_kernel_cred | 0xffffff80090d7f28 | | |
-| commit_creds | 0xffffff80090d7988 | | |
-
-物理地址公式: PA = 0x01080000 + (VA - 0xffffff8009080000)
 
 ### E. PP job 测试现状 (kort_pp_verify, 实测 2026-08-25 15:20)
 - sizeof(pp_start_job_s)=408, sizeof(wait_notif)=104 ✓ (与驱动期望一致)
