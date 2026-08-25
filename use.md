@@ -220,3 +220,19 @@ adb shell "chmod 755 /data/local/tmp/output && /data/local/tmp/output"
 
 ## 相关 CVE
 - CVE-2024-31317 - Mali Utgard GPU 越界写/外部内存绑定漏洞
+
+
+
+① 开 /dev/mali（无权限）	暴露面	设备节点对普通 app 可达（必要条件，但不是 bug 本身）
+② BIND 目标内核物理页	🔴 漏洞触发点	驱动接受了你给的物理地址（内核页），没校验它不属于你，直接给 GPU 建页表 → 你拿到该物理页的读写窗
+③ GPU DMA 读内核内存	利用原语	泄露基址
+④ GPU DMA 写 cred/modprobe_path/selinux	利用原语	覆写
+⑤ uid 0 + 满 cap + SELinux 放行	利用结果	root
+
+
+缺三样：
+
+离线 RVA 表没提取完（卡点）：kernel.bin 的 kallsyms 配对还没跑通，syms_rva.json 没生成 → exploit 的 CONFIG 块（各符号偏移）填不进去。
+写原语没实测通过：PP job 帧尺寸 bug 已定位（W=H=0x10），但还没跑出 PP_FINISHED: SUCCESS 证明 GPU 能真正 DMA 写内核页。
+运行时泄露代码没写：物理 RAM 扫描拿 phys_base 的逻辑清楚，但还没落到 kort_miboxs.c 里实跑。
+第 1 样是关键阻塞——它产出的 RVA 是 2 和 3 的前提。先把 kallsyms 配对跑通，其余才有坐标可填。

