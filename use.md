@@ -156,9 +156,37 @@ img文件在F:\down\player6\update_miboxs_a12
 3. **PLB/RSW 格式** — kort 的配置来自 Mali-400 老驱动, r10p1 可能不同
 4. shader 魔数 0x00020425/0x01e007cf 已在 libGLES_mali.so 中确认存在 → shader 格式应该兼容
 
+### UNKNOWN_ERR 根因已用源码定位 (2026-08-26 02:00) — 重要更新!
+源码仓库: `F:\down\player6\android_hardware_amlogic_kernel-modules_mali-driver-7a135203700d4f42af934f89f03efcb09953db77\...\utgard\r10p0\` (设备 r10p1 同源)。
+
+**根因链 (反汇编 + 源码双确认)**:
+```
+PP_INT_RAWSTAT & MASK_USED
+  ├─ 精确 == END_OF_FRAME(0x1) → SUCCESS (唯一成功路径)
+  └─ 任何其他位 → ERROR
+        → mali_pp_job_mark_sub_job_completed(job, FALSE)
+        → sub_job_errors++
+        → mali_pp_job_was_success = FALSE
+        → status = 0x800000 UNKNOWN_ERR (驱动合成, 非硬件直读)
+```
+错误位候选: WRITE_BOUNDARY_ERROR(bit8=0x100) / BUS_ERROR(bit4=0x10) / INVALID_PLIST_COMMAND(bit9=0x200) / CALL_STACK_OVERFLOW(bit11=0x800)。
+
+**WB 寄存器布局错位 (核心嫌疑)**:
+r10p1 硬件 WB 布局: [0]SourceSelect [1]TargetAddr [2]PixelFormat [3]AAFormat [4]Layout [5]ScanlineLength [6]TargetFlags [7]MRTEnable [8]MRTOffset...
+**kort 原版的 WB_MRT_BITS=4 实际写进 TargetFlags[6]** (Mali-400 忽略, Mali-450 可能严格执行报错); MRT Enable[7]=0 未设。
+
+**判别实验已内置** (kort_miboxs.c 新 --diag 模式, 写 GPU 自有内存无需 BIND):
+```
+adb shell /data/local/tmp/kort_miboxs_new --diag
+# cfg0: WB 禁用(渲染-only)   cfg1: WB on flags=0
+# cfg2: WB on legacy MRT=4   cfg3: WB on MRT=4+Enable=4
+# cfg4: WB on flags=0 stack=0x400
+```
+同时抓 dmesg: `adb shell "dmesg | grep -iE 'mali|pp|mmu' | tail -80"` 看 rawstat 实际错误位。
+
 ### 下一步
-1. 排查 UNKNOWN_ERR: 先去掉 CREATE_CONTEXT/flags 回到基线, 再逐个变量测试 (cache flush 用 cacheflush() syscall 而非 msync)
-2. 尝试创建 context 的正确姿势: 对照 libGLES_mali.so 反汇编确认 CREATE_CONTEXT 调用参数
+1. 跑 --diag 判别 + 抓 dmesg, 定位具体错误位
+2. 修正 WB 配置 (TargetFlags=0, 正确 Source Select/MRT Enable)
 3. 成功后 BIND modprobe_path 物理页 0x027df000 → PP job 多次写字符串
 4. 触发 modprobe → root (uid=0)
 
