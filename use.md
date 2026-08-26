@@ -628,3 +628,32 @@ Step 2: offset 8, RGBA=(0,0,0,0)
 4. 运行 kort_modprobe_2step 修改 modprobe_path
 5. 运行 trigger_modprobe 触发
 6. 检查 /data/local/tmp/rooted.txt 是否生成
+
+## 2026-08-26 IDA 验证: kort_selinux_1x1.c 写入失败根因
+
+**用 IDA 分析 mali.ko (r10p1) 确认:**
+
+1. **写入失败 = PP job 被硬件 abort**，不是 BIND 失败。
+   - `mali_scheduler_return_pp_job_to_user` (0x18250): 通知 status 写在 `data[8]`，
+     成功 = `0x10000` (bit16 置位)，abort = `0x800000` (bit23)。
+   - 代码 `notif.data + 8` 读 status 是**正确**的。
+   - 所以 "WB FAILED" 是因为 `status & (1<<16)` 为假 → 硬件 job abort。
+
+2. **根因: 默认 R8 像素格式 (0x04) 被 Mali-450 PP writeback 拒绝。**
+   - 对比能用的 `kort_miboxs_1x1.c`（用 RGBA8888 0x03）结构体/逻辑完全一致，
+     唯一区别就是像素格式。
+   - R8 (0x04) → PP job abort (0x800000) → 写入失败。
+   - 改用 RGBA8888 (0x03) 即与已验证可行的 modprobe 原语一致，WB 返回 0x10000。
+
+3. **已修复 kort_selinux_1x1.c:**
+   - 默认像素格式 R8(0x04) → RGBA8888(0x03)；保留 `--r8` 仅作调试（预期 abort）。
+   - WB FAILED 时打印 status 值（便于区分 0x800000 abort）。
+   - 加注: 此原语 8 字节对齐、~184 字节爆破写入，selinux_enforcing 周围 ~180 字节
+     内核数据被清零 → 几乎必 panic（16x16 测试已证明写到了但 reboot）。
+   - **结论: 用此原语做 4 字节精确写 selinux 本质不安全，根路径仍走 modprobe_path。**
+
+4. **附带确认的结构信息:**
+   - `mali_ukk_mem_bind` (0x8028): phys_addr 取自 uk 结构体 offset 24，external 路径 flags=0x800。
+   - `mali_pp_job_create` (0x14920): 驱动 `access_ok(a2+408)` 期望 PP job 结构体 408 字节
+     （当前代码结构体 400 字节，末尾 8 字节为栈垃圾 timeline_point_ptr，实测不影响，
+     但建议后续对齐到 408 字节以稳妥）。

