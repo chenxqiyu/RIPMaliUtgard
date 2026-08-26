@@ -657,3 +657,33 @@ Step 2: offset 8, RGBA=(0,0,0,0)
    - `mali_pp_job_create` (0x14920): 驱动 `access_ok(a2+408)` 期望 PP job 结构体 408 字节
      （当前代码结构体 400 字节，末尾 8 字节为栈垃圾 timeline_point_ptr，实测不影响，
      但建议后续对齐到 408 字节以稳妥）。
+
+## 2026-08-26 参考 ok/ 目录 + 突破分析（重要）
+
+### ok/ 里两套提权手法
+1. **kort_*（Amazon Fire 7 等）— 函数指针覆写（32位无 PAN）**
+   - MAP_EXT_MEM 绑内核物理页→GPU VA，PP job 用 WB 把**用户态 get_root_shell 地址**写进内核函数指针，MTK `/proc/driver/wmt_dbg` 触发 → `commit_creds(prepare_kernel_cred(0))`。
+   - **Mi Box S 是 64位+PAN，这套直接失效**（不能跳用户态，且 8 字节指针写不出）。
+2. **frels_*（Huawei P8 Lite 等）— UAF + 堆喷 + JOP（64位，能破 PAN）**
+   - 用的是 **Mali 分配器 UAF 漏洞**（`MALI_IOC_MEM_UNBIND` 引用计数 → 双重释放 → freelist 成环），再用 **`add_key` 堆喷**把伪造对象（含 8 字节内核函数指针/ROP 链）塞进 `kmalloc-128`。
+   - 触发：`/sys/kernel/debug/get_panel_data` 读操作调用被喷对象的函数指针 → JOP → `prepare_kernel_cred/commit_creds`。
+   - **写 8 字节任意值靠的是堆喷，不是 GPU DMA 写**；它压根没用我们的 BIND_MEM 原语。
+
+### 对 Mi Box S 的硬结论
+- 我们走 CVE-2024-31317 (BIND_MEM) GPU DMA 写。该原语 WB 写出的 tile 是**同一 RGBA 的 4 字节重复**，所以 64 位下：
+  - 写不出 8 字节内核地址（函数指针路线死）；
+  - 写不出任意路径串（modprobe 路线只剩 `"/tmp/tmp"` 这种 4 字节重复串能用）。
+- **`kort_miboxs_1x1.c` 的 bug**：它宣称写 `"/data/local/tmp/x"`，但 `wb_write_string` 按 4 字节步进（offset 0,4,8…）。WB 地址只有 8 字节对齐才生效，offset=4 被硬件下取整到 0 → 每次写都从字节 0 覆盖，最终只有最后一组 4 字节以 RGBA 重复存活 → 写出垃圾。**该文件不能写任意串，别再在这条路上耗。**
+- **唯一能正确写出的就是 `"/tmp/tmp"`（kort_modprobe_2step.c 的 offset 0 + offset 8 两步法，两步都 8 对齐，正确）。**
+
+### 当前真实卡点（第④步 payload 投递 + 第⑤步触发）
+1. **`/tmp` 是否存在**：若 Mi Box S 上 `/tmp` 是 → `/data/local/tmp` 的符号链接，则内核 exec `/tmp/tmp` 会解析到我们能创建的 `/data/local/tmp/tmp`，链就通了。若 `/tmp` 不存在/不可写 → BIND_MEM 原语在 64 位下**彻底无法投递**（无任何 4 字节重复绝对路径可创建）。
+2. **第⑤步触发**：已重写 `trigger_modprobe.c`，补上 **keyctl 触发**（`request_key`/`add_key`/`keyctl_search` 用不存在的 key type → `request_module("key-type-xxx")`，来自 ok 验证过的 unprivileged 触发面），健壮部署 payload 到 `/data/local/tmp/tmp`（覆盖 symlink 情形）+ `/tmp/tmp`，并去掉了原先无效的 `/proc/sys/kernel/modprobe` 写入噪音。已用 NDK 21.4 编译通过。
+
+### 若 `/tmp` 不存在时的两条出路
+- **A. 任意写原语**：让 PP 输出逐像素不同颜色（fragment shader 按位置算色 / 纹理采样），即可写任意字节 → 写 `modprobe_path="/data/local/tmp/x"`（可创建路径）→ 触发。绕开 KASLR，最干净。难度在中 Mali-450 PP shader ISA。
+- **B. 切到 Mali UAF+堆喷漏洞**（frels 路线）：若 Mi Box S 的 r10p1 驱动也有 `unbind` 引用计数 UAF，则可用堆喷获得任意写，直接上 64 位 JOP 链。需先在设备上确认该 UAF 是否存在（单独漏洞研究）。
+
+### 立即可执行
+- 设备上 `ls -la /tmp` 确认 `/tmp` 是否存在/是 symlink（一锤定音）。
+- 跑 `kort_modprobe_2step` → `trigger_modprobe`（已增强），看 `rooted.txt` 是否生成。
