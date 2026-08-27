@@ -7,5 +7,5 @@ set CLANG=C:\Users\Administrator\AppData\Local\Android\Sdk\ndk\21.4.7075529\tool
 
 
 
-%CLANG% x_payload.c -o x_payload -static
-adb push x_payload /data/local/tmp/ && adb shell chmod 755 /data/local/tmp/x_payload
+%CLANG% b_probe.c -o b_probe -static
+adb push b_probe /data/local/tmp/ && adb shell chmod 755 /data/local/tmp/b_probe
